@@ -1,6 +1,11 @@
 # PLARV Argus
 
-Real-time ML training monitor. Detects NaN explosions, gradient collapse, optimizer corruption, and silent divergence — before they destroy your run.
+[![PyPI version](https://img.shields.io/pypi/v/plarv-argus-sdk?color=black&style=for-the-badge)](https://pypi.org/project/plarv-argus-sdk/)
+[![License: MIT](https://img.shields.io/github/license/plarv/Plarv-argus-sdk?color=black&style=for-the-badge)](https://github.com/plarv/Plarv-argus-sdk/blob/main/LICENSE)
+[![Python Versions](https://img.shields.io/pypi/pyversions/plarv-argus-sdk?color=black&style=for-the-badge)](https://pypi.org/project/plarv-argus-sdk/)
+[![GitHub stars](https://img.shields.io/github/stars/plarv/Plarv-argus-sdk?color=black&style=for-the-badge)](https://github.com/plarv/Plarv-argus-sdk/stargazers)
+
+Real-time ML training monitor. Detects NaN explosions, gradient collapse, optimizer corruption, and silent forensic anomalies. Non-custodial by design.
 
 ---
 
