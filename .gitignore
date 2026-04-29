@@ -1,0 +1,31 @@
+# 🛡️ PLARV Argus — Global Git Exclusion
+# Standard Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# 📦 Local Checkpoints (Benchmarking artifacts)
+bench_ckpt.pt
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# 🔦 Forensic Logs & Temporary Spools
+argus_spool/
+*.log
+.DS_Store
+
+# ⚙️ Environment
+.env
+venv/
+env/
+.venv/
+.vscode/
+.idea/

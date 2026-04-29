@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plarv-argus-sdk"
+version = "1.0.0"
+description = "Active guardrail for AI training. Prevents crashes before they happen."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = ["machine learning", "training", "monitoring", "guardrail", "pytorch", "safety"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Zero hard dependencies — stdlib only for core
+# torch/transformers/lightning are optional (user already has them)
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "torch", "transformers", "pytorch-lightning"]
+
+[project.urls]
+Homepage = "https://plarv.com"
+"Web App" = "https://argus.plarv.com"
+Documentation = "https://plarv.com/docs/sdk-quickstart"
+Repository = "https://github.com/plarv/plarv-argus-sdk"
+"Bug Tracker" = "https://github.com/plarv/plarv-argus-sdk/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["plarv*"]
+exclude = ["test*", "*.egg-info", "tests*"]
