@@ -3,7 +3,11 @@ PLARV Argus — Local Detector
 ==============================
 Open source. Runs entirely on user's machine.
 No data sent anywhere. No network calls.
-Complements the Argus engine with signals that need raw model access.
+
+Note:
+    Runs entirely on the user's machine. No data leaves the process.
+    Open source by design — raw model access should never require
+    trusting a third party.
 
 Detects 5 failure modes the telemetry engine cannot see:
   1. Dead neurons        — activations stuck at zero
@@ -301,11 +305,11 @@ class LocalDetector:
     GRAD_FLOW_WARN_RATIO     = 0.01   # 1%
     WEIGHT_IMBALANCE_RATIO   = 20.0   # 20x imbalance = critical
     WEIGHT_IMBALANCE_WARN    = 10.0   # 10x imbalance = warn
-    OPTIMIZER_CORRUPTION_Z   = 1.2    # 1.2 z-score (was 2.0)
-    OPTIMIZER_CORRUPTION_WARN = 1.0   # 1.0 z-score (was 1.5)
+    OPTIMIZER_CORRUPTION_Z   = 3.0    # 3.0 z-score
+    OPTIMIZER_CORRUPTION_WARN = 2.0   # 2.0 z-score
     ATTENTION_ENTROPY_THRESHOLD = 0.05  # entropy below 0.05 = collapsed
     ATTENTION_ENTROPY_WARN      = 0.15  # entropy below 0.15 = warning
-    HARDWARE_ANOMALY_THRESHOLD  = 1.5   # 50% unexplained weight norm jump
+    HARDWARE_ANOMALY_THRESHOLD  = 10.0  # 10x unexplained weight norm jump (Bit-flip)
     PRECISION_EROSION_THRESHOLD = 0.20  # 20% of updates are underflow
     REPRESENTATION_VAR_THRESHOLD = 1e-5 # variance below this = collapse
 
@@ -313,7 +317,7 @@ class LocalDetector:
     MAX_TENSOR_ELEMENTS      = 100       # 500 -> 100 for <1% overhead
     MAX_GRAD_ELEMENTS        = 100       # 250 -> 100 for speed
     CHECK_EVERY_STEPS        = 100       # Global hook stride
-    ANALYTICAL_STRIDE        = 1         # Deep scan stride
+    ANALYTICAL_STRIDE        = 100       # Deep scan stride
 
     # Optimizer warmup — ignore first N steps to let momentum stabilize
     OPTIMIZER_WARMUP_STEPS = 5
@@ -966,13 +970,6 @@ class LocalDetector:
     
 
         
-    # =========================================================================
-    # Loss Spike Preventer (Incomplete - Disabled to fix IndentationError)
-    # =========================================================================
-    #
-    # def _check_loss_spike(self, loss: float) -> Dict[str, Any]:
-    #     return {"level": "ok", "details": {}}
-
 
 
 
@@ -991,15 +988,17 @@ class LocalDetector:
             name = self._param_names[idx]
             param = self._cached_params.get(name)
             
-            if param is not None and param.data.dim() >= 2:
+            if self._step > 10 and param is not None and param.data.dim() >= 2:
                 curr_norm = param.data.detach().float().norm().item()
                 prev_norm = self._prev_weight_norms.get(name)
                 
                 if prev_norm is not None and prev_norm > 1e-8:
                     ratio = max(curr_norm / prev_norm, prev_norm / curr_norm)
                     if ratio > self.HARDWARE_ANOMALY_THRESHOLD:
+                        # 🛡️ SOVEREIGN TOLERANCE: Only flag if the jump is massive 
+                        # AND the gradient is tiny (suggesting non-optimizer change).
                         grad_norm = self._grad_norms.get(name, 0.0)
-                        if grad_norm < prev_norm * 0.1:
+                        if grad_norm < prev_norm * 0.01:
                             anomalies[name] = round(ratio, 2)
                 
                 self._prev_weight_norms[name] = curr_norm

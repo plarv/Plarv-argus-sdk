@@ -1,21 +1,25 @@
 
 """
-Argus data quality index ADQI — Model Agnostic
+Argus Data Quality Index (ADQI) — Model Agnostic
 =================================================
-Measures training data quality from training dynamics alone.
+Infers training data quality by analyzing training dynamics.
 No raw data access required. Works for any model type.
 
 Architecture:
     1. Signal Extractor  — maps any training run to (x, y)
     2. Phase Detector    — splits run into Early / Mid / Late adaptively
-    3. DQI Components    — DS, VS, SC, DU per phase
-    4. DQI Fusion        — weighted scalar per phase + total
+    3. ADQI Components   — DS, VS, SC, DU per phase
+    4. ADQI Fusion       — weighted scalar per phase + total
 
 Philosophy:
-    Volume is not quality. 1000 well-distributed points > 1M clustered
-    between 0.3-0.4. DQI measures coverage and distribution, not count.
-    Training dynamics (loss curve, gradient norms) expose this without
-    ever touching raw data — making DQI modality agnostic by design.
+    ADQI is an instrument for indirect inference. It does not measure the dataset itself;
+    it measures the manifested properties of the training trajectory and
+    infers the quality of the signal source. 
+
+    Volume is not quality. ADQI uses signal manifold properties—specifically loss span, 
+    distribution, and curvature—to infer domain coverage and distribution.
+    This indirect measurement allows for privacy-preserving, real-time
+    quality assessment across any model modality.
 """
 
 import numpy as np
@@ -36,12 +40,12 @@ class PhaseResult:
     VS: float           # Variation Strength
     SC: float           # Shape Complexity
     DU: float           # Density Uniformity
-    dqi: float          # Phase DQI score
+    dqi: float          # Phase ADQI score
 
 
 @dataclass
-class DQIResult:
-    total: float                    # Final weighted DQI [0, 1]
+class ADQIResult:
+    total: float                    # Final weighted ADQI [0, 1]
     early: PhaseResult
     mid: PhaseResult
     late: PhaseResult
@@ -52,7 +56,7 @@ class DQIResult:
 # ============================================================
 # SIGNAL EXTRACTOR — Translation Layer
 # Converts training run data into (x, y) arrays
-# This is what makes DQI model agnostic
+# This is what makes ADQI model agnostic
 # ============================================================
 
 def extract_signal(
@@ -62,7 +66,7 @@ def extract_signal(
     signal_preference: str = "loss"
 ) -> tuple[np.ndarray, np.ndarray, str]:
     """
-    Maps any training run to (x, y) for DQI computation.
+    Maps any training run to (x, y) for ADQI computation.
 
     x = training steps (universal domain axis)
     y = chosen signal (universal quality proxy)
@@ -70,7 +74,7 @@ def extract_signal(
     Priority: loss > grad_norm > steps-only fallback
 
     TODO (Future Task): Add a NaN-strip or NaN-interpolation step here 
-    so DQI degrades gracefully instead of propagating NaNs through the math.
+    so ADQI degrades gracefully instead of propagating NaNs through the math.
 
     Args:
         steps:             Training step indices
@@ -123,7 +127,7 @@ def extract_signal(
 # No hardcoded step counts — adapts to each training run
 # ============================================================
 
-def detect_phases(x: np.ndarray, y: np.ndarray) -> tuple[int, int]:
+def detect_phases(x: np.ndarray, y: np.ndarray) -> tuple[int, int, np.ndarray]:
     """
     Finds two split points dividing run into Early / Mid / Late.
 
@@ -132,7 +136,7 @@ def detect_phases(x: np.ndarray, y: np.ndarray) -> tuple[int, int]:
     Mid phase ends where descent flattens toward convergence.
 
     Returns:
-        (split1, split2) — indices into x/y arrays
+        (split1, split2, dy) — split indices and the velocity signal
     """
     n = len(x)
 
@@ -193,28 +197,20 @@ def detect_phases(x: np.ndarray, y: np.ndarray) -> tuple[int, int]:
     # Ensure split2 is not too close to the end
     split2 = min(split2, n - min_size)
 
-    return split1, split2
+    return split1, split2, dy
 
 
 # ============================================================
-# DQI COMPONENTS
+# ADQI COMPONENTS
 # ============================================================
 
-def domain_spread_score(x: np.ndarray) -> float:
-    """
-    Nyquist-Shannon: effective coverage of the domain.
-    High DS → samples spread across wide range.
-    Low DS → clustered or narrow range.
-    """
-    if len(x) < 3:
+def domain_spread_score(y: np.ndarray, y_global_span: float) -> float:
+    if len(y) < 3:
         return 0.0
-    x_sorted = np.sort(x)
-    span = x_sorted[-1] - x_sorted[0]
-    if span <= 1e-12:
+    if y_global_span <= 1e-12:
         return 0.0
-    avg_gap = np.mean(np.diff(x_sorted)) + 1e-12
-    effective_samples = span / avg_gap
-    return float(np.clip(np.tanh(effective_samples / 20), 0.0, 1.0))
+    phase_span = float(np.max(y) - np.min(y))
+    return float(np.clip(phase_span / y_global_span, 0.0, 1.0))
 
 
 def variation_score(y: np.ndarray) -> float:
@@ -242,6 +238,14 @@ def shape_complexity_score(x: np.ndarray, y: np.ndarray) -> float:
         return 0.0
     idx = np.argsort(x)
     x_s, y_s = x[idx], y[idx]
+    
+    # 🛡️ SOVEREIGN SMOOTHING: Add a small Low-Pass Filter (Moving Average)
+    # to y_s before calculating d2. This prevents high-frequency jitter
+    # from tricking the score into thinking the trajectory is "complex."
+    if len(y_s) > 5:
+        window = 3
+        y_s = np.convolve(y_s, np.ones(window)/window, mode='same')
+
     dx = np.diff(x_s) + 1e-12
     d1 = np.diff(y_s) / dx
     d2 = np.diff(d1) / (np.diff(x_s[:-1]) + 1e-12)
@@ -250,19 +254,15 @@ def shape_complexity_score(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.clip(np.tanh(var_d2 / mean_d1), 0.0, 1.0))
 
 
-def density_uniformity_score(x: np.ndarray) -> float:
-    """
-    Sampling quality: are samples evenly distributed?
-    DU = 1 / (1 + CV_gaps)
-
-    This is the mathematical expression of the core DQI intuition:
-    90% of data in 2% of the bucket → CV explodes → DU collapses.
-    """
-    if len(x) < 4:
+def density_uniformity_score(y: np.ndarray, n_bins: int = 10) -> float:
+    if len(y) < 4:
         return 0.0
-    gaps = np.diff(np.sort(x))
-    mean_gap = np.mean(gaps) + 1e-12
-    cv = np.std(gaps) / mean_gap
+    y_min, y_max = np.min(y), np.max(y)
+    if (y_max - y_min) <= 1e-12:
+        return 0.0
+    counts, _ = np.histogram(y, bins=n_bins)
+    mean_count = np.mean(counts) + 1e-12
+    cv = np.std(counts) / mean_count
     return float(np.clip(1.0 / (1.0 + cv), 0.0, 1.0))
 
 
@@ -271,13 +271,14 @@ def compute_phase_dqi(
     y: np.ndarray,
     name: str,
     step_start: int,
-    step_end: int
+    step_end: int,
+    y_global_span: float
 ) -> PhaseResult:
-    """Compute all four DQI components for one phase slice."""
-    DS = domain_spread_score(x)
+    """Compute all four ADQI components for one phase slice."""
+    DS = domain_spread_score(y, y_global_span)
     VS = variation_score(y)
     SC = shape_complexity_score(x, y)
-    DU = density_uniformity_score(x)
+    DU = density_uniformity_score(y)
     dqi = float(np.clip(DS * VS * SC * DU, 0.0, 1.0))
     return PhaseResult(
         name=name,
@@ -288,17 +289,7 @@ def compute_phase_dqi(
     )
 
 
-# ============================================================
-# PHASE WEIGHTS
-# Early phase matters most — foundation of learning.
-# Bad early phase rarely recovers. Good late phase alone is not enough.
-# ============================================================
 
-DEFAULT_PHASE_WEIGHTS = {
-    "early": 0.50,
-    "mid":   0.30,
-    "late":  0.20,
-}
 
 
 # ============================================================
@@ -312,7 +303,7 @@ def compute_dqi(
     signal_preference: str = "loss",
     phase_weights: Optional[dict] = None,
     scale_100: bool = False
-) -> DQIResult:
+) -> ADQIResult:
     """
     Compute model-agnostic Data Quality Intelligence.
 
@@ -329,7 +320,7 @@ def compute_dqi(
         scale_100:         Return scores on 0-100 scale
 
     Returns:
-        DQIResult with total score + per-phase breakdown
+        ADQIResult with total score + per-phase breakdown
     """
     steps = np.array(steps, dtype=float)
     if loss is not None:
@@ -337,13 +328,32 @@ def compute_dqi(
     if grad_norm is not None:
         grad_norm = np.array(grad_norm, dtype=float)
 
-    weights = phase_weights or DEFAULT_PHASE_WEIGHTS
 
     # Extract universal (x, y) signal
     x, y, signal_name = extract_signal(steps, loss, grad_norm, signal_preference)
 
-    # Detect adaptive phase boundaries
-    s1, s2 = detect_phases(x, y)
+    # Detect adaptive phase boundaries and extract velocity energy
+    s1, s2, dy = detect_phases(x, y)
+
+    # 🛡️ DYNAMIC ENERGY WEIGHTING
+    # Instead of hardcoded heuristics, we calculate weights based on the 
+    # integral of the learning signal in each phase.
+    if phase_weights:
+        weights = phase_weights
+    else:
+        e_early = float(np.sum(dy[:s1]))
+        e_mid   = float(np.sum(dy[s1:s2]))
+        e_late  = float(np.sum(dy[s2:]))
+        total_e = e_early + e_mid + e_late
+        
+        if total_e <= 1e-12:
+            weights = {"early": 0.333, "mid": 0.333, "late": 0.334}
+        else:
+            weights = {
+                "early": e_early / total_e,
+                "mid":   e_mid / total_e,
+                "late":  e_late / total_e
+            }
 
     # Slice phases
     slices = {
@@ -352,9 +362,11 @@ def compute_dqi(
         "late":  (x[s2:],       y[s2:],        s2, len(x)),
     }
 
+    y_global_span = float(np.max(y) - np.min(y))
+
     phases = {}
     for name, (px, py, ps, pe) in slices.items():
-        phases[name] = compute_phase_dqi(px, py, name, int(ps), int(pe))
+        phases[name] = compute_phase_dqi(px, py, name, int(ps), int(pe), y_global_span)
 
     # Weighted fusion
     total = sum(weights[p] * phases[p].dqi for p in ["early", "mid", "late"])
@@ -369,7 +381,7 @@ def compute_dqi(
             p.SC  *= 100
             p.DU  *= 100
 
-    return DQIResult(
+    return ADQIResult(
         total=total,
         early=phases["early"],
         mid=phases["mid"],
@@ -387,5 +399,5 @@ def get_dqi_score(
     steps, loss=None, grad_norm=None,
     signal_preference="loss", scale_100=False
 ) -> float:
-    """Return just the total DQI scalar."""
+    """Return just the total ADQI scalar."""
     return compute_dqi(steps, loss, grad_norm, signal_preference, scale_100=scale_100).total

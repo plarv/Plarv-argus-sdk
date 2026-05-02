@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plarv-argus-sdk"
-version = "1.0.0"
+version = "1.1.2"
 description = "Active guardrail for AI training. Prevents crashes before they happen."
 readme = "README.md"
 requires-python = ">=3.8"

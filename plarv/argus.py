@@ -254,12 +254,16 @@ class _CheckpointManager:
         self._pending_advance = False
         self._pending_advance_since = None
         
+        self._pending_promotions: List[Dict] = []
+        self.STABILITY_WINDOW = 5 # Steps to wait for confirmation
+        
         # 🧵 BACKGROUND I/O ENGINE
         self._io_executor = ThreadPoolExecutor(max_workers=2)
         self._io_lock     = threading.Lock()
 
         os.makedirs(checkpoint_dir, exist_ok=True)
         self._init_slots()
+        self._cleanup_stale_tmp()
         self._warn_disk_space()
 
     def register_save_fn(self, fn: callable):
@@ -271,7 +275,17 @@ class _CheckpointManager:
         signal_dict: full response from engine
         harm_pressure: current hp from engine
         """
-        # 1. Engine-Directed Slot Selection
+        # 1. HANDLE STABILITY WINDOW (PROMOTION/PURGE)
+        if harm_pressure > 0:
+            # 🛡️ SOVEREIGN PURGE: If any smell is detected, discard all unconfirmed saves
+            if self._pending_promotions and not self.silent:
+                print(f"[PLARV] Harm detected (hp={harm_pressure}). Purging {len(self._pending_promotions)} unconfirmed disk snapshots.")
+            self._purge_pending()
+        else:
+            # 🛡️ STABILITY PROMOTION: Check if any pending saves have matured
+            self._promote_matured(step)
+
+        # 2. Engine-Directed Slot Selection
         slot_idx = signal_dict.get("checkpoint_slot")
         if slot_idx is not None:
             # Force target slot (1-indexed from API -> 0-indexed internal)
@@ -284,8 +298,9 @@ class _CheckpointManager:
         anchor_step = signal_dict.get("proactive_anchor", step)
         reason      = signal_dict.get("checkpoint_reason", "ENGINE_PULSE")
 
-        # 2. TRIGGER ASYNC SAVE
-        self._save_async(step, slot_idx, anchor_step, reason)
+        # 3. TRIGGER ASYNC STAGED SAVE (only if engine explicitly asked for it)
+        if signal_dict.get("checkpoint_signal") in ("SAVE", "SAVE_NOW"):
+            self._save_async(step, slot_idx, anchor_step, reason)
 
         # Freeze entire buffer when collapse confirmed
         if harm_pressure >= 2 and not self._frozen:
@@ -311,37 +326,43 @@ class _CheckpointManager:
         self._current_slot = (self._current_slot + 1) % self.SLOTS
 
     def _save_async(self, step: int, slot: int, anchor_step: int, reason: str):
-        """Zero-block staged save: Snap in main thread, write in worker thread."""
+        """Zero-block staged save: Snap in main thread, write to .tmp, promote later."""
         if self._save_fn is None or self._frozen:
             return
 
-        path = self._slot_path(slot)
+        final_path = self._slot_path(slot)
+        staging_path = final_path + ".tmp"
         
         # STAGE 1: Main Thread - Capture Snapshot
         try:
-            background_writer = self._save_fn(path, anchor_step)
+            background_writer = self._save_fn(staging_path, anchor_step)
             if not callable(background_writer):
-                # Fallback: if not using staging, just call it
-                self._save_fn(path)
+                # Fallback: if not using staging, just call it (non-async)
+                self._save_fn(staging_path, anchor_step)
                 return
         except Exception as e:
             if not self.silent: print(f"[PLARV] [ERROR] Failed to stage checkpoint: {e}")
             return
 
-        # STAGE 2: Background Thread - Disk I/O
+        # STAGE 2: Background Thread - Disk I/O to .tmp
         def io_worker():
             with self._io_lock:
                 try:
-                    background_writer() # Performs the actual torch.save/Disk write
-                    self._slot_meta[slot] = {
+                    os.makedirs(staging_path, exist_ok=True)
+                    background_writer() # Performs the actual torch.save/Disk write to .tmp
+                    
+                    # Store for promotion after stability window
+                    self._pending_promotions.append({
                         "step":        step,
+                        "slot":        slot,
+                        "staging_path": staging_path,
+                        "final_path":   final_path,
                         "anchor_step": anchor_step,
                         "reason":      reason,
-                        "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    }
-                    self._write_manifest()
+                        "captured_at": time.time()
+                    })
                     if not self.silent:
-                        print(f"[PLARV] Zero-Block Save Complete: Slot {slot} (Step {step})")
+                        print(f"[PLARV] Snapshot Staged: Slot {slot} (Step {step}) waiting for confirmation...")
                 except Exception as e:
                     if not self.silent: print(f"[PLARV] [ERROR] Background Disk Write Failed (Slot {slot}): {e}")
 
@@ -405,6 +426,54 @@ class _CheckpointManager:
         except Exception as e:
             if not self.silent:
                 print(f"[PLARV] Slot {slot} save failed at step {step}: {e}")
+
+    def _promote_matured(self, current_step: int):
+        """Promotes snapshots that have survived the stability window."""
+        ready = [p for p in self._pending_promotions if (current_step - p["step"]) >= self.STABILITY_WINDOW]
+        if not ready:
+            return
+
+        with self._io_lock:
+            for p in ready:
+                try:
+                    # 🛡️ ATOMIC PROMOTION: Rename .tmp to final path
+                    if os.path.exists(p["final_path"]):
+                        shutil.rmtree(p["final_path"])
+                    os.rename(p["staging_path"], p["final_path"])
+                    
+                    slot = p["slot"]
+                    self._slot_meta[slot] = {
+                        "step":        p["step"],
+                        "anchor_step": p["anchor_step"],
+                        "reason":      p["reason"],
+                        "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    if not self.silent:
+                        print(f"[PLARV] Slot {slot} Certified & Promoted (Step {p['step']})")
+                except Exception as e:
+                    if not self.silent: print(f"[PLARV] [ERROR] Promotion failed for Slot {p['slot']}: {e}")
+            
+            # Update manifest and clear from pending
+            self._write_manifest()
+            self._pending_promotions = [p for p in self._pending_promotions if (current_step - p["step"]) < self.STABILITY_WINDOW]
+
+    def _purge_pending(self):
+        """Discard all unconfirmed snapshots because harm was detected."""
+        with self._io_lock:
+            for p in self._pending_promotions:
+                try:
+                    if os.path.exists(p["staging_path"]):
+                        shutil.rmtree(p["staging_path"])
+                except Exception: pass
+            self._pending_promotions = []
+
+    def _cleanup_stale_tmp(self):
+        """Removes any .tmp directories from previous failed runs."""
+        for entry in os.listdir(self.checkpoint_dir):
+            if entry.endswith(".tmp"):
+                try:
+                    shutil.rmtree(os.path.join(self.checkpoint_dir, entry))
+                except Exception: pass
 
     def _advance_slot(self, step: int):
         self._current_slot = (self._current_slot + 1) % self.SLOTS
@@ -1271,18 +1340,47 @@ class Argus:
         except Exception: pass
 
     def _decrypt_payload(self, encrypted_hex: str) -> Dict:
-        """Zero-dep XOR decryption using rolling SHA256 key derived from API Key."""
+        """
+        Sovereign Authenticated Decryption (Stdlib-only).
+        Uses HMAC-SHA256 for integrity and SHA256-CTR for confidentiality.
+        Nonce-based to prevent keystream reconstruction.
+        """
+        import hmac
         try:
-            encrypted_bytes = bytes.fromhex(encrypted_hex)
+            raw = bytes.fromhex(encrypted_hex)
+            # Payload Structure: Nonce (16) | HMAC (32) | Ciphertext (N)
+            if len(raw) < 48:
+                return {}
+
+            nonce      = raw[:16]
+            auth_tag   = raw[16:48]
+            ciphertext = raw[48:]
+
             key = hashlib.sha256(self.api_key.encode()).digest()
+
+            # 1. VERIFY INTEGRITY (HMAC-SHA256)
+            # Authenticate [Nonce | Ciphertext] to prevent malleability
+            expected_tag = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()
+            if not hmac.compare_digest(auth_tag, expected_tag):
+                if not self.silent: 
+                    print("[PLARV] [SECURITY] Sentinel Authentication Failed: HMAC mismatch.")
+                return {}
+
+            # 2. DECRYPT (CTR-mode using SHA256 as block function)
             decrypted = bytearray()
-            for i in range(len(encrypted_bytes)):
-                # Rolling key for each byte
-                block_key = hashlib.sha256(key + str(i // 32).encode()).digest()
-                decrypted.append(encrypted_bytes[i] ^ block_key[i % 32])
+            for i in range(0, len(ciphertext), 32):
+                # Unique block key: SHA256(Key + Nonce + Counter)
+                counter = (i // 32).to_bytes(4, 'big')
+                block_key = hashlib.sha256(key + nonce + counter).digest()
+                
+                chunk = ciphertext[i:i+32]
+                for j in range(len(chunk)):
+                    decrypted.append(chunk[j] ^ block_key[j])
+
             return json.loads(decrypted.decode())
         except Exception as e:
-            if not self.silent: print(f"[PLARV] [ERROR] Sentinel Decryption Failed: {e}")
+            if not self.silent: 
+                print(f"[PLARV] [ERROR] Sentinel Decryption Failed: {e}")
             return {}
 
     def _step0_gate(self, payload):
