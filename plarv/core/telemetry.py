@@ -49,8 +49,11 @@ def _probe_gpu() -> Dict:
         vram  = []
         for i in range(count):
             props = torch.cuda.get_device_properties(i)
-            names.append(props.name)
-            vram.append(round(props.total_memory / 1024**3, 1))  # GB
+            # 🛡️ SOVEREIGN MASKING: Only report vendor and VRAM to protect IP
+            vendor = "NVIDIA" if "NVIDIA" in props.name.upper() else "GENERIC"
+            vram_gb = round(props.total_memory / 1024**3, 1)
+            names.append(f"{vendor} {vram_gb}GB")
+            vram.append(vram_gb)
 
         return {
             "available": True,
@@ -127,7 +130,7 @@ class RunTelemetry:
       - On stop (run_end event)
     """
 
-    _ANALYTICS_PATH = "/api/v2/telemetry"
+    _ANALYTICS_PATH = "/v2/telemetry"
 
     def __init__(
         self,

@@ -231,7 +231,7 @@ class LocalReport:
         if self.top_affected_layers:
             lines.append(f"  Top affected: {', '.join(self.top_affected_layers[:5])}")
         checks = {
-            "activation_sparsity": self.dead_neurons,
+            "dead_neurons":        self.dead_neurons,
             "saturation":          self.saturation,
             "gradient_flow":       self.gradient_flow,
             "weight_imbalance":    self.weight_imbalance,
@@ -370,6 +370,11 @@ class LocalDetector:
             # Pre-cache model structure for zero overhead in step()
             self._cached_params = {n: p for n, p in self.model.named_parameters() if p.requires_grad}
             self._param_names   = sorted(list(self._cached_params.keys()))
+            
+            # Build your absolute step 0 baseline norm map immediately
+            for name, param in self._cached_params.items():
+                if param.data.dim() >= 2:
+                    self._prev_weight_norms[name] = param.data.detach().float().norm().item()
             
             # Collect and cache all eligible modules
             eligible = []
@@ -1047,10 +1052,13 @@ class LocalDetector:
                 if flat_grad.numel() > self.MAX_GRAD_ELEMENTS:
                     flat_grad = flat_grad[:self.MAX_GRAD_ELEMENTS]
                 
+                # Cast to CPU float array immediately to avoid CUDA context sync locks
+                flat_grad_cpu = flat_grad.detach().cpu().float()
+                
                 # Only check non-zero gradients — zeros / noise are usually intentional sparsity
-                mask = flat_grad.abs() > 1e-12
+                mask = flat_grad_cpu.abs() > 1e-12
                 if mask.any():
-                    underflow_frac = (flat_grad[mask].abs().float() * lr < eps).float().mean().item()
+                    underflow_frac = (flat_grad_cpu[mask].abs() * lr < eps).float().mean().item()
                 else:
                     underflow_frac = 0.0
                 

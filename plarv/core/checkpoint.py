@@ -63,7 +63,7 @@ class _CheckpointManager:
                     "step": step,
                     "path": os.path.abspath(path),
                     "ts": int(time.time()),
-                    "version": "2.0.0"
+                    "version": "1.1.4"
                 }, f)
         except: pass
 

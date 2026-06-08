@@ -43,7 +43,7 @@ class _NetworkClient:
         self._headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "PlarvArgusSDK/2.0.0"
+            "User-Agent": "PlarvArgusSDK/1.1.4"
         }
 
     def fire_async(self, payload: Any, callback=None):
@@ -55,7 +55,7 @@ class _NetworkClient:
 
     def _post(self, payload: Any) -> Optional[Dict]:
         """Synchronous POST with jitter and backoff."""
-        url = f"{self.base_url}/api/v2/telemetry"
+        url = f"{self.base_url}/v2/telemetry"
         data = json.dumps(payload).encode()
         
         # Jittered backoff simulation (if needed)

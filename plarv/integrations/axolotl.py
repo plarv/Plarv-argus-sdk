@@ -4,14 +4,14 @@ from typing import Any, Dict, Optional
 
 # Attempt to import Axolotl's BasePlugin if available in the environment
 try:
-    from axolotl.integrations.base import BasePlugin
+    from axolotl.integrations.base import BasePlugin # type: ignore
 except ImportError:
     # Fallback for environments where axolotl is not installed locally
     class BasePlugin:
         pass
 
 from plarv.argus import Argus
-from plarv.callback import ArgusCallback
+from plarv.integrations.callback import ArgusCallback
 
 logger = logging.getLogger("axolotl.integrations.plarv")
 

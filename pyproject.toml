@@ -4,12 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plarv-argus-sdk"
-version = "1.1.2"
-description = "Active guardrail for AI training. Prevents crashes before they happen."
+version = "1.1.5"
+description = "Official Python client for the Plarv Argus forensic platform. Real-time LLM training guardrail, debugging, and anomaly detection."
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
-keywords = ["machine learning", "training", "monitoring", "guardrail", "pytorch", "safety"]
+keywords = [
+    "machine learning", "training", "monitoring", "guardrail", "pytorch", 
+    "safety", "llm", "deep learning", "debugging", "telemetry", "ai", 
+    "loss spike", "gradient collapse", "huggingface", "transformers", "axolotl", "unsloth"
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

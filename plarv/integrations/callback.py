@@ -20,7 +20,7 @@ from ..argus import Argus
 from ..exceptions import ArgusPause, ArgusCheckpoint
 
 try:
-    from transformers import TrainerCallback
+    from transformers import TrainerCallback # type: ignore
     _Base = TrainerCallback
 except ImportError:
     _Base = object
@@ -60,12 +60,6 @@ class ArgusCallback(_Base):
         checkpoint_keep_last:     int           = 2,
         checkpoint_dir:           str           = "./argus-checkpoints",
     ):
-        if argus is None and api_key is None:
-            raise ValueError(
-                "[PLARV] ArgusCallback requires either api_key= or argus=. "
-                "Example: ArgusCallback(api_key='your-key')"
-            )
-
         # Store pre-built instance if provided — skip internal construction
         self._argus: Optional[Argus] = argus
 

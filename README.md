@@ -1,11 +1,13 @@
-# PLARV Argus
+# PLARV Argus Python SDK — Real-Time LLM Training Guardrail & Forensics
+
+> **Looking for the dashboard?** Visit the [Plarv Argus Web Platform](https://argus.plarv.com) to view your training forensics.
 
 [![PyPI version](https://img.shields.io/pypi/v/plarv-argus-sdk?color=black&style=for-the-badge)](https://pypi.org/project/plarv-argus-sdk/)
 [![License: MIT](https://img.shields.io/github/license/plarv/Plarv-argus-sdk?color=black&style=for-the-badge)](https://github.com/plarv/Plarv-argus-sdk/blob/main/LICENSE)
-[![Python Versions](https://img.shields.io/pypi/pyversions/plarv-argus-sdk?color=black&style=for-the-badge)](https://pypi.org/project/plarv-argus-sdk/)
 [![GitHub stars](https://img.shields.io/github/stars/plarv/Plarv-argus-sdk?color=black&style=for-the-badge)](https://github.com/plarv/Plarv-argus-sdk/stargazers)
 
-Real-time ML training monitor. Detects NaN explosions, gradient collapse, optimizer corruption, and silent forensic anomalies. Non-custodial by design.
+The official Python client for the **Plarv Argus real-time ML & LLM forensic platform**. 
+Designed for PyTorch, HuggingFace, Unsloth, and Axolotl. Detects NaN explosions, gradient collapse, loss spikes, and silent training anomalies instantly. Non-custodial by design.
 
 ---
 
@@ -29,34 +31,48 @@ Zero hard dependencies. PyTorch, Transformers, and Lightning are optional — Ar
 
 ## How it works
 
-Argus sits alongside your training loop. Every step, it reports telemetry to the Argus engine, which runs a 12-signal analysis and returns an action. If something is wrong, it tells you — and optionally stops the run, saves a checkpoint, or adjusts your learning rate automatically.
+Argus sits alongside your training loop. Every step, it reports telemetry to the Argus engine, which runs an authoritative 12-signal analysis (V4 Forensic Specification) and returns an action. If something is wrong, it tells you — and optionally saves a checkpoint, or adjusts your learning rate automatically.
 
 All API calls are async. Argus never blocks your training loop.
 
 ---
 
-## Quick start
+## Quick Start
 
-```python
+### Option A: Zero-Line (Recommended)
+Argus automatically discovers your API key from environment variables and attaches to your optimizer.
 
-from plarv import Argus
-
-# Initialize the Control Plane
-argus = Argus(api_key="your-key")
-
-for batch in dataloader:
-    loss = model(inputs, labels)
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
-
-    argus.step(loss)
-
-argus.complete()
-
+```bash
+export PLARV_API_KEY="your-key"
 ```
 
-`grad_norm` is optional — Argus computes it automatically from your model if not provided. Exceptions are caught by default so Argus never crashes your training run.
+```python
+from plarv import Argus
+
+# Zero-argument discovery: auto-hooks into your optimizer and model
+argus = Argus(optimizer=optimizer, model=model)
+
+for batch in dataloader:
+    loss = train_step(batch)
+    optimizer.step() # Telemetry is sent automatically
+```
+
+### Option B: Manual (8-Line Integration)
+If you prefer explicit control, use the manual `step()` method.
+
+```python
+from plarv import Argus
+
+argus = Argus(api_key="plarv-...")  # get yours at https://argus.plarv.com
+
+for step, batch in enumerate(dataloader):
+    loss = train_step(batch)
+    argus.step(loss=loss) # Explicit report
+    
+argus.complete()
+```
+
+For full implementation details, see the [examples/](file:///Users/sharif/Desktop/plarv-sdk/examples) directory.
 
 ---
 
@@ -274,7 +290,7 @@ Plarv Argus is designed with **Sovereign Privacy** at its core. We maintain a st
 argus = Argus(api_key="your-key", mode="AUTO")
 ```
 
-In AUTO mode, catch `ArgusPause` to save state before the run stops:
+In AUTO mode, catch `ArgusPause` to save state on collapse:
 
 ```python
 from plarv.exceptions import ArgusPause
@@ -348,7 +364,6 @@ from plarv.exceptions import (
 #   ArgusIntervention       — base for training interventions (.step, .response)
 #     ArgusPause            — engine requested pause
 #     ArgusCheckpoint       — engine requested checkpoint
-#     ArgusHalt             — sentinel hard stop (SIG_HALT_NOW)
 ```
 
 ---
@@ -368,7 +383,7 @@ from plarv.exceptions import (
 - `plarv/`: The primary package.
   - `core/`: Internal machinery (Network, Telemetry, Checkpoints).
   - `integrations/`: Framework connectors (Lightning, HuggingFace, etc.).
-  - `client.py`: The main Argus orchestrator.
+  - `argus.py`: The main Argus orchestrator.
   - `local.py`: The LocalDetector forensic engine.
 - `tests/`: Forensic validation suite.
 - `benchmarks/`: Performance auditing tools (`overhead.py`).

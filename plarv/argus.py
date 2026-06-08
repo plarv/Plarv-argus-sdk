@@ -15,6 +15,7 @@ import os
 import random
 import shutil
 import string
+import sys
 import threading
 import time
 import uuid
@@ -100,6 +101,8 @@ class _NetworkClient:
         # 🛡️ SILENT TERMINATION: If the run was stopped by the user, ignore the error
         if body and "already STOPPED" in str(body):
             return
+        if body and "already COMPLETED" in str(body):
+            return
 
         with self._lock:
             self.consecutive_failures += 1
@@ -110,7 +113,13 @@ class _NetworkClient:
                 if status:
                     print(f"!!! HTTP STATUS: {status}")
                 if body:
-                    print(f"!!! RESPONSE:    {body}")
+                    # 🛡️ SANITIZED OUTPUT: Only show the message to prevent system info leaks
+                    try:
+                        import json
+                        err_msg = json.loads(body).get("message", "Request Failed")
+                        print(f"!!! RESPONSE:    {err_msg}")
+                    except Exception:
+                        print("!!! RESPONSE:    [Encrypted/Unreadable]")
                 print(f"!!! Last successful ping: {time.ctime(self.last_success_time) if self.last_success_time else 'NEVER'}")
                 print("!" * 80 + "\n")
 
@@ -533,11 +542,11 @@ class Argus:
     """
 
     _BASE_URL = os.getenv("PLARV_API_URL", "https://api.plarv.com")
-    _US_URL   = f"{_BASE_URL}/api/v2/detect"
+    _US_URL   = f"{_BASE_URL}/v2/detect"
 
     def __init__(
         self,
-        api_key:                  str,
+        api_key:                  Optional[str]      = None,
         run_id:                   Optional[str]      = None,
         optimizer:                Optional[Any]      = None,
         model:                    Optional[Any]      = None,
@@ -564,12 +573,32 @@ class Argus:
         dtype:                    str                = "unknown",
         raw_signals:              bool               = False,
         gauntlet_bypass:          Optional[str]      = None,
+        auto_attach:              bool               = True,
+        watchdog_timeout:         Optional[int]      = 300,
     ):
-        if not api_key:
-            raise ArgusConfigurationError("PLARV API Key is required for Argus initialization.")
+        # 🛡️ ZERO-ARGUMENT DISCOVERY
+        if api_key is None:
+            api_key = os.getenv("PLARV_API_KEY")
+        # 🛡️ HARDENED API KEY VALIDATION
+        if not api_key or not isinstance(api_key, str) or len(api_key.strip()) < 8 or "YOUR_PLARV_API_KEY" in api_key:
+            raise ArgusConfigurationError(
+                "A valid PLARV API Key is required. "
+                "Please get your key from https://argus.plarv.com"
+            )
         
         self.api_key       = api_key
         self.silent        = silent
+        self.watchdog_timeout = watchdog_timeout
+
+        # ⚓️ AUTO-CRASH DETECTION
+        if sys.excepthook.__name__ != '_argus_excepthook':
+            _orig_excepthook = sys.excepthook
+            def _argus_excepthook(exc_type, exc_value, exc_traceback):
+                if not issubclass(exc_type, KeyboardInterrupt):
+                    self.fail(reason=f"unhandled_exception: {exc_type.__name__}")
+                sys.excepthook = _orig_excepthook
+                _orig_excepthook(exc_type, exc_value, exc_traceback)
+            sys.excepthook = _argus_excepthook
 
         # Sync global network client with silence preference
         if self.silent:
@@ -588,6 +617,9 @@ class Argus:
         self.fail_open     = fail_open  
         self.catch_exceptions = catch_exceptions
         self.total_epochs  = total_epochs
+        self.auto_attach   = auto_attach
+        self._last_auto_step = -1
+        self._step           = 0
         
         # 🤖 AUTO-ESTIMATE TOTAL STEPS
         self.total_steps   = total_steps
@@ -615,9 +647,13 @@ class Argus:
         self.vocab_size      = vocab_size      or auto_meta.get("vocab_size", 0)
         self.num_layers      = num_layers      or auto_meta.get("num_layers", 0)
         self.hidden_dim      = hidden_dim      or auto_meta.get("hidden_dim", 0)
-        self.dtype           = dtype           if dtype != "unknown" else auto_meta.get("dtype", "unknown")
-
-        # 🌐 DISTRIBUTED SOVEREIGNTY (DDP/Multi-GPU)
+        self.dtype           = dtype if dtype != "unknown" else auto_meta.get("dtype", "unknown")
+        
+        # ⚓️ AUTO-ATTACH (DEEP HOOKING)
+        if self.auto_attach and self.optimizer:
+            self._attach_to_optimizer()
+            
+        # 🔒 START INTERVENTION MONITORING
         self.rank = self._detect_rank()
         self.is_master = (self.rank == 0)
         
@@ -640,12 +676,11 @@ class Argus:
 
         self._executor  = ThreadPoolExecutor(max_workers=2)
         import atexit
-        atexit.register(self._executor.shutdown, wait=False)
+        atexit.register(self._executor.shutdown, wait=True)
         
-        self._future: Optional[Future] = None
+        self._futures = []
         self._last_payload: Optional[Dict] = None
         self._decision  = _Decision()
-        self._step      = 0
         self._prev_loss = None
         self._completed = False
         self._degraded  = False
@@ -663,6 +698,7 @@ class Argus:
         self._run_status = "idle"
         self._prev_grad_norm: Optional[float] = None
         self._spike_samples: List[int] = []
+        self.lr_warmup_restart_requested: bool = False
         self._local_first_seen: Dict[str, int] = {}
         self._sentinel_intent: Optional[str] = None
 
@@ -686,19 +722,20 @@ class Argus:
         #     print("=" * 80 + "\n")
         
         # Ensure argus/ folder exists for secrets and spooling
-        os.makedirs(self.argus_dir, exist_ok=True)
-        try:
-            secret_path = os.path.join(self.argus_dir, "secret")
-            with open(secret_path, "w") as f:
-                f.write(self.intervention_secret)
-            # Remove legacy root secret if it exists
-            if os.path.exists(".argus_secret"):
-                os.remove(".argus_secret")
-        except Exception:
-            pass
-
-        # Spool manager for catch-up logic
-        self._spooler   = _SpoolManager(self.argus_dir)
+        # 🔒 [V2 DEPRECATED] — Skipping argus/ folder and secret contamination for now
+        # os.makedirs(self.argus_dir, exist_ok=True)
+        # try:
+        #     secret_path = os.path.join(self.argus_dir, "secret")
+        #     with open(secret_path, "w") as f:
+        #         f.write(self.intervention_secret)
+        #     # Remove legacy root secret if it exists
+        #     if os.path.exists(".argus_secret"):
+        #         os.remove(".argus_secret")
+        # except Exception:
+        #     pass
+        
+        # Spool manager disabled to prevent folder contamination
+        self._spooler   = None # _SpoolManager(self.argus_dir)
         
         # 📡 ADAPTIVE PACKER STATE
         self._telemetry_buffer = []
@@ -733,6 +770,11 @@ class Argus:
     # PUBLIC API: ARGUS PROTOCOL (TELEMETRY & INTERVENTION)
     # =========================================================================
 
+    @property
+    def spike_samples(self) -> List[int]:
+        """List of sample IDs identified by the engine as spikes, to be excluded."""
+        return self._spike_samples
+
     def wait_for_registration(self, timeout: float = 300, poll_interval: float = 5.0):
         """Polls the backend until the run is pre-registered and ready."""
         if not self.silent:
@@ -742,7 +784,7 @@ class Argus:
         while time.time() - start_time < timeout:
             try:
                 import urllib.request
-                url = f"{self._BASE_URL}/api/v2/status/{self.run_id}"
+                url = f"{self._BASE_URL}/v2/status/{self.run_id}"
                 req = urllib.request.Request(url, headers=self._headers, method="GET")
                 with urllib.request.urlopen(req, timeout=5) as r:
                     status_resp = json.loads(r.read().decode())
@@ -766,7 +808,7 @@ class Argus:
         while time.time() - start_time < timeout:
             try:
                 import urllib.request
-                url = f"{self._BASE_URL}/api/v2/runs/{self.run_id}/job"
+                url = f"{self._BASE_URL}/v2/runs/{self.run_id}/job"
                 req = urllib.request.Request(url, headers=self._headers, method="GET")
                 with urllib.request.urlopen(req, timeout=5) as r:
                     job_resp = json.loads(r.read().decode())
@@ -801,13 +843,71 @@ class Argus:
             if self._run_status != "paused":
                 self.complete()
 
+    def _attach_to_optimizer(self):
+        """Patches the optimizer's step() method to trigger Argus automatically."""
+        if not self.optimizer:
+            return
+
+        import torch
+        if not hasattr(torch.Tensor, "_original_backward_argus_patched"):
+            torch.Tensor._original_backward_argus_patched = torch.Tensor.backward
+            
+            def patched_backward(t_self, *args, **kwargs):
+                import plarv.argus
+                plarv.argus._global_last_loss = t_self.item()
+                return torch.Tensor._original_backward_argus_patched(t_self, *args, **kwargs)
+                
+            torch.Tensor.backward = patched_backward
+
+        original_step = self.optimizer.step
+        
+        def patched_step(*args, **kwargs):
+            result = original_step(*args, **kwargs)
+            
+            try:
+                import plarv.argus
+                loss_val = getattr(plarv.argus, "_global_last_loss", None)
+                
+                grad_norm = None
+                grad_sim = None
+                if self.model:
+                    parameters = [p for p in self.model.parameters() if p.grad is not None]
+                    if parameters:
+                        import math
+                        # 1. Compute Gradient Norm
+                        grad_norm = math.sqrt(sum(p.grad.data.norm(2).item()**2 for p in parameters))
+                        
+                        # 2. Compute Gradient Similarity (Cosine)
+                        cur_grads = torch.cat([p.grad.data.clone().view(-1) for p in parameters])
+                        prev_grads = getattr(plarv.argus, "_global_prev_grads", None)
+                        if prev_grads is not None:
+                            dot = (cur_grads * prev_grads).sum().item()
+                            norm = cur_grads.norm().item() * prev_grads.norm().item() + 1e-8
+                            grad_sim = float(max(0.0, min(1.0, dot / norm)))
+                        else:
+                            grad_sim = 1.0
+                            
+                        plarv.argus._global_prev_grads = cur_grads.clone()
+                        plarv.argus._global_last_grad_sim = grad_sim
+                
+                self.step(loss=loss_val, grad_norm=grad_norm, gradient_similarity=grad_sim)
+            except Exception as e:
+                pass
+            
+            return result
+        
+        # Apply the patch
+        try:
+            self.optimizer.step = patched_step
+        except: pass
+
     # =========================================================================
     # PUBLIC API: STEPS (RESTORATION)
     # =========================================================================
 
     def step(
         self,
-        loss:              float,
+        loss:              Optional[float]       = None,
         grad_norm:         Optional[float]       = None,
         *,
         local_report:      Optional[Any]         = None,
@@ -820,204 +920,183 @@ class Argus:
         sample_correct:    Optional[List[bool]]  = None,
         forward_ms:        Optional[float]       = None,
         backward_ms:       Optional[float]       = None,
-        grad_l1_norm:      Optional[float]       = None,
-        grad_l2_norm:      Optional[float]       = None,
+        grad_l1_norm:          Optional[float]       = None,
+        grad_l2_norm:          Optional[float]       = None,
+        gradient_similarity:   Optional[float]       = None,
         epoch:             int                   = 0,
         update_norm:       Optional[float]       = None,
         val_loss:          Optional[float]       = None,
         is_anchor:         bool                  = False,
         current_lr:        float                 = 0.0,
+        lr_restarted:      bool                  = False,
     ) -> Dict[str, Any]:
         """Report one training step. Returns the current engine decision state."""
-        if not self.is_master: return {}
-        if self._completed: return {}
-        if self._should_stop and self.catch_exceptions: return self._decision.raw
-
-        # 📡 Measure Batch Timing
-        now = time.time()
-        if self._last_step_time is not None:
-            delta_ms = (now - self._last_step_time) * 1000
-            self._avg_batch_time_ms = 0.9 * self._avg_batch_time_ms + 0.1 * delta_ms
-            # Calculate packing factor: how many batches fit in one RTT
-            # We cap it at 10 to keep payloads reasonable
-            self._packing_factor = max(1, min(10, int(self._rtt_ms / (self._avg_batch_time_ms + 1e-6))))
-        self._last_step_time = now
-
         try:
-            self._run_status = "training"
-            loss_val   = float(loss)
-            
-            # High-Fidelity Signal Extraction
-            if grad_norm is not None:
-                grad_val = float(grad_norm)
-                grad_segments = {"early": 0.0, "mid": 0.0, "late": 0.0}
-            else:
-                # FAST PATH: for most steps, compute global norm only
-                # DEEP PATH: every ANALYTICAL_STRIDE, compute segments
-                if self._step % self.ANALYTICAL_STRIDE == 0:
-                    gn_data = self._auto_grad_norm(full=True)
+            if not self.is_master: return {}
+            if self._completed: return {}
+            if self._should_stop and self.catch_exceptions: return self._decision.raw
+
+            # 📡 Measure Batch Timing
+            now = time.time()
+            if self._last_step_time is not None:
+                delta_ms = (now - self._last_step_time) * 1000
+                self._avg_batch_time_ms = 0.9 * self._avg_batch_time_ms + 0.1 * delta_ms
+            self._last_step_time = now
+
+            try:
+                self._run_status = "training"
+                loss_val   = float(loss) if loss is not None else 0.0
+                
+                # High-Fidelity Signal Extraction
+                if grad_norm is not None:
+                    grad_val = float(grad_norm)
+                    grad_segments = {"early": 0.0, "mid": 0.0, "late": 0.0}
                 else:
-                    gn_data = self._auto_grad_norm(full=False)
+                    if self._step % self.ANALYTICAL_STRIDE == 0:
+                        gn_data = self._auto_grad_norm(full=True)
+                    else:
+                        gn_data = self._auto_grad_norm(full=False)
+                    grad_val = gn_data["total"]
+                    grad_segments = {k: gn_data.get(k, 0.0) for k in ("early", "mid", "late")}
+
+                loss_delta = (loss_val - self._prev_loss) if self._prev_loss is not None else 0.0
+                ppl        = perplexity if perplexity is not None else min(math.exp(min(loss_val, 20)), 1e6)
+         
+                if gradient_similarity is not None:
+                    grad_sim = float(max(0.0, min(1.0, gradient_similarity)))
+                else:
+                    grad_sim = 0.5
+                    if self._prev_grad_norm is not None and grad_val > 0:
+                        ratio    = min(self._prev_grad_norm, grad_val) / max(self._prev_grad_norm, grad_val)
+                        grad_sim = max(0.0, min(1.0, ratio))
                 
-                grad_val = gn_data["total"]
-                grad_segments = {k: gn_data.get(k, 0.0) for k in ("early", "mid", "late")}
+                self._prev_grad_norm = grad_val
+                B = len(sample_ids) if sample_ids else 8
 
-            loss_delta = (loss_val - self._prev_loss) if self._prev_loss is not None else 0.0
-            ppl        = perplexity if perplexity is not None else min(math.exp(min(loss_val, 20)), 1e6)
-     
-            grad_sim = 0.5
-            if self._prev_grad_norm is not None and grad_val > 0:
-                ratio    = min(self._prev_grad_norm, grad_val) / max(self._prev_grad_norm, grad_val)
-                grad_sim = max(0.0, min(1.0, ratio))
-            self._prev_grad_norm = grad_val
-            B = len(sample_ids) if sample_ids else 8
+                # Update DQI History
+                self._step_history.append(self._step)
+                self._loss_history.append(loss_val)
+                if grad_val is not None:
+                    self._grad_norm_history.append(grad_val)
 
-            # Update DQI History
-            self._step_history.append(self._step)
-            self._loss_history.append(loss_val)
-            if grad_val is not None:
-                self._grad_norm_history.append(grad_val)
+                if self._step % self.ANALYTICAL_STRIDE == 0 and len(self._step_history) > 10:
+                    try:
+                        dqi_res = compute_dqi(
+                            steps=self._step_history,
+                            loss=self._loss_history,
+                            grad_norm=self._grad_norm_history if len(self._grad_norm_history) == len(self._loss_history) else None
+                        )
+                        self._current_dqi = dqi_res.total
+                    except Exception: pass
 
-            # Periodically compute DQI (Stride = 100)
-            if self._step % self.ANALYTICAL_STRIDE == 0 and len(self._step_history) > 10:
-                try:
-                    dqi_res = compute_dqi(
-                        steps=self._step_history,
-                        loss=self._loss_history,
-                        grad_norm=self._grad_norm_history if len(self._grad_norm_history) == len(self._loss_history) else None
-                    )
-                    self._current_dqi = dqi_res.total
-                except Exception:
-                    pass
+                payload = self._build_payload(
+                    step=self._step, epoch=epoch,
+                    loss=loss_val, loss_delta=loss_delta,
+                    grad_norm=grad_val, grad_sim=grad_sim, ppl=ppl,
+                    B=B,
+                    sample_ids=sample_ids,
+                    sample_losses=sample_losses,
+                    sample_confidences=sample_confidences,
+                    sample_margins=sample_margins,
+                    sample_entropies=sample_entropies,
+                    sample_correct=sample_correct,
+                    forward_ms=forward_ms,
+                    backward_ms=backward_ms,
+                    grad_segments=grad_segments,
+                    grad_l1_norm=grad_l1_norm,
+                    grad_l2_norm=grad_l2_norm,
+                    update_norm=update_norm,
+                    val_loss=val_loss,
+                    with_histogram=(self._step % self.ANALYTICAL_STRIDE == 0),
+                    is_anchor=is_anchor,
+                    current_lr=current_lr,
+                    lr_restarted=lr_restarted,
+                )
 
-            # Re-generate payload if with_histogram was true for this step (analytical stride)
-            # Or just ensure it was built correctly. 
-            # Actually, I should have built it AFTER updating DQI.
-            payload = self._build_payload(
-                step=self._step, epoch=epoch,
-                loss=loss_val, loss_delta=loss_delta,
-                grad_norm=grad_val, grad_sim=grad_sim, ppl=ppl,
-                B=B,
-                sample_ids=sample_ids,
-                sample_losses=sample_losses,
-                sample_confidences=sample_confidences,
-                sample_margins=sample_margins,
-                sample_entropies=sample_entropies,
-                sample_correct=sample_correct,
-                forward_ms=forward_ms,
-                backward_ms=backward_ms,
-                grad_segments=grad_segments,
-                grad_l1_norm=grad_l1_norm,
-                grad_l2_norm=grad_l2_norm,
-                update_norm=update_norm,
-                val_loss=val_loss,
-                with_histogram=(self._step % self.ANALYTICAL_STRIDE == 0),
-                is_anchor=is_anchor,
-                current_lr=current_lr
-            )
+                if local_report is not None:
+                    worst = local_report.worst_level
+                    if worst in ("warn", "critical") and worst not in self._local_first_seen:
+                        self._local_first_seen[worst] = self._step
 
-            # LOCAL HEALTH SIGNAL BRIDGE (Pull from protected local detector)
-            if local_report is not None:
-                worst = local_report.worst_level
-                if worst in ("warn", "critical") and worst not in self._local_first_seen:
-                    self._local_first_seen[worst] = self._step
+                    payload["local_health"] = {
+                        "worst_level":       worst,
+                        "trend":             local_report.trend,
+                        "scale":             local_report.scale,
+                        "affected_fraction": local_report.affected_fraction,
+                        "sparsity_delta":    getattr(local_report, "sparsity_delta", 0.0),
+                        "attention_entropy_min": getattr(local_report, "attention_entropy_min", None),
+                        "first_seen_step":   self._local_first_seen.get(worst),
+                        "last_stable_step":  self._ckpt.last_stable_step if self._ckpt else None,
+                    }
 
-                # Extract schema-aligned fields if they exist in the moat's report
-                sparsity_delta = getattr(local_report, "sparsity_delta", 0.0)
-                entropy_min    = getattr(local_report, "attention_entropy_min", None)
-
-                payload["local_health"] = {
-                    "worst_level":       worst,
-                    "trend":             local_report.trend,
-                    "scale":             local_report.scale,
-                    "affected_fraction": local_report.affected_fraction,
-                    "sparsity_delta":    sparsity_delta,
-                    "attention_entropy_min": entropy_min,
-                    "first_seen_step":   self._local_first_seen.get(worst),
-                    "last_stable_step": (
-                        self._ckpt.last_stable_step if self._ckpt is not None else None
-                    ),
-                }
-
-            # 📦 ADAPTIVE PACKING
-            self._telemetry_buffer.append(payload)
-            
-            # Flush if buffer full, or if we have a critical signal, or if it's the very first step
-            should_flush = (len(self._telemetry_buffer) >= self._packing_factor) or \
-                           (local_report is not None and local_report.worst_level == "critical") or \
-                           (self._step <= 1)
-            
-            if should_flush:
-                pack = self._telemetry_buffer if len(self._telemetry_buffer) > 1 else self._telemetry_buffer[0]
-                self._telemetry_buffer = []
+                self._telemetry_buffer.append(payload)
+                should_flush = (len(self._telemetry_buffer) >= self._packing_factor) or \
+                               (local_report is not None and local_report.worst_level == "critical") or \
+                               (self._step <= 1)
                 
-                if local_report is not None and local_report.worst_level == "critical":
-                    if not self.silent: print(f"[PLARV] LOCAL CRITICAL FAILURE at step {self._step} — pausing.")
-                    self._fire_async(pack)
-                    self._should_stop = True
-                    # Local detector uses ArgusPause for consistency with remote interventions
-                    raise ArgusPause(f"Local detector critical: {local_report.worst_level}", step=self._step, response={"source": "local_detector"})
+                if should_flush:
+                    pack = self._telemetry_buffer if len(self._telemetry_buffer) > 1 else self._telemetry_buffer[0]
+                    self._telemetry_buffer = []
+                    if local_report is not None and local_report.worst_level == "critical":
+                        if not self.silent: print(f"[PLARV] LOCAL CRITICAL FAILURE at step {self._step} — pausing.")
+                        self._should_stop = True
+                        raise ArgusPause(f"Local detector critical: {local_report.worst_level}", step=self._step, response={"source": "local_detector"})
+                    
+                    def _async_flush(url, headers, payload):
+                        try:
+                            resp = _post(url, headers, payload, 10.0, retries=2)
+                            if resp: self._handle_response(resp)
+                        except Exception:
+                            pass
+                            
+                    self._executor.submit(_async_flush, self._url, self._headers, pack)
 
-                self._fire_async(pack)
+                action, hp, cb, alert = self._decision.read()
+                resp_body = self._decision.raw
+                if self._verify_sentinel_halt(resp_body):
+                    method = resp_body.get("sentinel_command", "SIG_HALT_NOW")
+                    self._stop_acknowledge(method=method)
+                    raise ArgusHalt(f"Sentinel Halt Triggered: {method}", step=self._step, response=resp_body)
+                
+         
+                self._prev_loss = float(loss_val)
+                if self._telemetry:
+                    self._telemetry.on_step(step=self._step, loss=loss_val, batch_size=B)
+                    
+                return self._decision.raw
 
-            if self._step == 0:
-                self._step0_gate(payload)
-            else:
-                resp = self._collect_previous()
-                if resp: self._handle_response(resp)
-
-            # Apply current decision state after every step
-            action, hp, cb, alert = self._decision.read()
-            
-            # Detect Graceful Stop (200 OK or 400 'already STOPPED')
-            resp_body = self._decision.raw
-            # 🛡️ SECURITY FAST-PATH: Immediate halt if secret verified
-            if self._verify_sentinel_halt(resp_body):
-                method = resp_body.get("sentinel_command", "SIG_HALT_NOW")
-                self._stop_acknowledge(method=method)
-                raise ArgusHalt(f"Sentinel Halt Triggered: {method}", step=self._step, response=resp_body)
-            
-            if action in ("PAUSE", "BUDGET_PAUSE"):
-                self._apply_decision(action, hp, cb)
-     
-            self._prev_loss = float(loss_val)
-            self._last_step_time = time.time()
-            
-            # Update background telemetry (zero latency)
-            if self._telemetry:
-                self._telemetry.on_step(step=self._step, loss=loss_val, batch_size=B)
-            
+            except (ArgusPause, ArgusHalt) as e:
+                raise e
+            except Exception as e:
+                if self.catch_exceptions:
+                    if not self.silent: print(f"[PLARV] SDK Internal Warning: {str(e)}")
+                    return self._decision.raw
+                raise e
+        finally:
+            self._last_auto_step = self._step
             self._step += 1
-            
-            # 🏁 AUTO-COMPLETION PROTOCOL
             if self.total_steps and self._step >= self.total_steps:
                 if not self.silent:
                     print(f"[PLARV] Target reached ({self.total_steps} steps). Finalizing run...")
+                self._should_stop = True
                 self.complete(status="COMPLETED")
-                
-            return self._decision.raw
-
-        except (ArgusPause, ArgusHalt) as e:
-            raise e
-        except ArgusError as e:
-            if self.catch_exceptions:
-                if not self.silent:
-                    print(f"[PLARV] Notice: {str(e)}")
-                return self._decision.raw
-            raise e
-        except Exception as e:
-            if self.catch_exceptions:
-                if not self.silent:
-                    print(f"[PLARV] SDK Internal Warning: {str(e)}")
-                return self._decision.raw
-            raise e
 
     def _stop_acknowledge(self, method: str = "SIG_HALT_NOW"):
         """Explicitly notify backend that manual stop signal was received and handled."""
         if self._completed: return
         self._completed = True
         self._run_status = "stopped"
-        self._executor.shutdown(wait=False)
+        if getattr(self, "_telemetry_buffer", None):
+            pack = self._telemetry_buffer if len(self._telemetry_buffer) > 1 else self._telemetry_buffer[0]
+            self._telemetry_buffer = []
+            def _final_flush(url, headers, payload):
+                try:
+                    resp = _post(url, headers, payload, 10.0, retries=2)
+                    if resp: self._handle_response(resp)
+                except Exception: pass
+            self._executor.submit(_final_flush, self._url, self._headers, pack)
+            
+        self._executor.shutdown(wait=True)
         self._telemetry.stop()
         
         try:
@@ -1030,21 +1109,32 @@ class Argus:
                 "method":                   method
             }
             # 🛡️ DETERMINISTIC HANDSHAKE: High-priority signal to dedicated endpoint
-            _post(f"{self._BASE_URL}/api/v2/runs/{self.run_id}/stop-acknowledge", self._headers, payload, 5.0, retries=3)
+            _post(f"{self._BASE_URL}/v2/runs/{self.run_id}/stop-acknowledge", self._headers, payload, 5.0, retries=3)
         except Exception: pass
         if not self.silent:
             print(f"[PLARV] Manual Halt Handshake Succeeded. Status: STOPPED at step {self._step}.")
 
     def complete(self, status: str = "COMPLETED", step: int = None, error: Optional[str] = None):
         """Signal end of training run. status can be 'COMPLETED' or 'FAILED'."""
-        if self._completed: return
-        self._completed = True
+        with threading.Lock():
+            if self._completed: return
+            self._completed = True
         
         # 🛡️ Capture final step if not provided
         final_step = step if step is not None else self._step
         
         self._run_status = status.lower()
-        self._executor.shutdown(wait=False)
+        if getattr(self, "_telemetry_buffer", None):
+            pack = self._telemetry_buffer if len(self._telemetry_buffer) > 1 else self._telemetry_buffer[0]
+            self._telemetry_buffer = []
+            def _final_flush(url, headers, payload):
+                try:
+                    resp = _post(url, headers, payload, 10.0, retries=2)
+                    if resp: self._handle_response(resp)
+                except Exception: pass
+            self._executor.submit(_final_flush, self._url, self._headers, pack)
+            
+        self._executor.shutdown(wait=True)
         self._telemetry.stop(status=status, error=error)
         try:
             # 🛡️ IDEMPOTENCY: ensure multiple stop calls (on crash/exit) don't duplicate
@@ -1056,16 +1146,51 @@ class Argus:
                 "step": final_step,
                 "error": error
             }
-            _post(f"{self._BASE_URL}/api/v2/complete", headers, payload, 5.0, retries=5)
+            _post(f"{self._BASE_URL}/v2/complete", headers, payload, 5.0, retries=5)
         except Exception: pass
         if not self.silent:
             msg = f"Run {self.run_id} {status.lower()} at step {final_step}."
             if error: msg += f" Error: {error}"
             print(f"[PLARV] {msg}")
 
+    def fail(self, reason: str, cliff_step: int = None):
+        """Signal an abnormal failure (OOM, NaN, deadlock)."""
+        with threading.Lock():
+            if self._completed: return
+            self._completed = True
+            
+        final_step = cliff_step if cliff_step is not None else self._step
+        self._run_status = "failed"
+        if getattr(self, "_telemetry_buffer", None):
+            pack = self._telemetry_buffer if len(self._telemetry_buffer) > 1 else self._telemetry_buffer[0]
+            self._telemetry_buffer = []
+            def _final_flush(url, headers, payload):
+                try:
+                    resp = _post(url, headers, payload, 10.0, retries=2)
+                    if resp: self._handle_response(resp)
+                except Exception: pass
+            self._executor.submit(_final_flush, self._url, self._headers, pack)
+            
+        self._executor.shutdown(wait=True)
+        self._telemetry.stop(status="FAILED", error=reason)
+        try:
+            headers = self._headers.copy()
+            headers["x-idempotency-key"] = f"fail-{self.run_id}"
+            payload = {
+                "run_id": self.run_id,
+                "reason": reason,
+                "cliff_step": final_step
+            }
+            # Fast timeout (3.0s) and no retries to avoid hanging during process exit
+            _post(f"{self._BASE_URL}/v2/fail", headers, payload, 3.0, retries=0)
+        except Exception:
+            pass
+        if not self.silent:
+            print(f"[PLARV] Run {self.run_id} failed at step {final_step}: {reason}")
+
     def _heartbeat_worker(self):
         """Daemon thread: machine presence."""
-        pulse_url = f"{self._BASE_URL}/api/v2/heartbeat"
+        pulse_url = f"{self._BASE_URL}/v2/heartbeat"
         while not self._completed:
             try:
                 payload = {
@@ -1084,10 +1209,45 @@ class Argus:
                 
             time.sleep(30.0)
 
+    def _calibrate_network(self):
+        """Send 3-5 unauthenticated pings to warm up Lambda and measure true latency."""
+        import urllib.request
+        latencies = []
+        health_url = f"{self._BASE_URL}/v2/health"
+        
+        # 3 fast pings to bypass AWS Lambda cold start
+        for _ in range(3):
+            try:
+                t0 = time.time()
+                req = urllib.request.Request(health_url, method="GET")
+                with urllib.request.urlopen(req, timeout=3.0) as r:
+                    r.read()
+                latencies.append((time.time() - t0) * 1000)
+            except Exception:
+                pass
+                
+        if latencies:
+            self._rtt_ms = min(latencies)
+            if self._rtt_ms < 200:
+                self._packing_factor = 1
+            elif self._rtt_ms < 500:
+                self._packing_factor = 3
+            else:
+                self._packing_factor = 5
+                
+            if not self.silent:
+                print(f"[PLARV] Network Calibrated: {self._rtt_ms:.1f}ms RTT. Adaptive Packing: {self._packing_factor} steps/batch.")
+        else:
+            self._packing_factor = 1
+            if not self.silent:
+                print("[PLARV] Network Calibration Failed. Defaulting to strict step-by-step reporting.")
+
     def _preregister(self):
         """Creates the run entry in the DB and prepares the registry."""
         if not self.is_master:
             return
+            
+        self._calibrate_network()
             
         try:
             # 🛡️ IDEMPOTENCY: Ensure run registration is atomic and unique
@@ -1103,14 +1263,11 @@ class Argus:
                 "total_steps":  self.total_steps,
             }
             
-            t0 = time.time()
-            resp = _post(f"{self._BASE_URL}/api/v2/runs", headers, payload, 5.0, retries=5)
-            self._rtt_ms = (time.time() - t0) * 1000
-            
-            if not self.silent:
-                print(f"[PLARV] Network RTT to US-East-1 calibrated: {self._rtt_ms:.1f}ms")
+            resp = _post(f"{self._BASE_URL}/v2/runs", headers, payload, 5.0, retries=5)
             
             # 🛡️ ENGINE-SYNC: Catch early signals (like directed checkpoints) during registration
+            if not self.silent:
+                print(f"[PLARV DEBUG] Preregister response: {resp}")
             self._handle_response(resp)
         except Exception:
             pass
@@ -1131,6 +1288,7 @@ class Argus:
         with_histogram: bool = False,
         is_anchor: bool = False,
         current_lr: float = 0.0,
+        lr_restarted: bool = False,
     ) -> Dict:
         """RESTORED comprehensive payload building."""
         has_layer2 = all(x is not None for x in [
@@ -1143,13 +1301,14 @@ class Argus:
             "step":          step,
             "epoch":         epoch,
             "model_type":    self.model_type,
-            "sdk_version":   "1.0.0",
+            "sdk_version":   "1.1.4",
             "is_anchor":     is_anchor,
             "anchor":        is_anchor,
             # Aggressive Optimization: only compute histogram on stride
             "histogram":     self._compute_histogram(bins=8) if with_histogram else None,
+            "nan_detected":  math.isnan(loss) or math.isinf(loss) if isinstance(loss, float) else False,
             "training": {
-                "loss":                 loss,
+                "loss":                 min(abs(loss) if not (math.isnan(loss) or math.isinf(loss)) else 1e9, 1e6) if isinstance(loss, float) else loss,
                 "loss_delta":           loss_delta,
                 "grad_norm":            grad_norm,
                 "gradient_similarity":  grad_sim,
@@ -1160,7 +1319,7 @@ class Argus:
                 "grad_sim_slope":       0.0,
                 "dqi_score":            self._current_dqi,
                 "current_lr":           current_lr,
-                "lr_restarted":         False,
+                "lr_restarted":         lr_restarted,
                 "is_anchor":            is_anchor,
                 "anchor":               is_anchor,
             },
@@ -1210,7 +1369,16 @@ class Argus:
         if self.total_epochs is not None: payload["total_epochs"] = self.total_epochs
         if self.total_steps is not None: payload["total_steps"] = self.total_steps
 
-        return payload
+        def _sanitize(v):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return 1e9
+            if isinstance(v, dict):
+                return {k: _sanitize(val) for k, val in v.items()}
+            if isinstance(v, list):
+                return [_sanitize(val) for val in v]
+            return v
+            
+        return _sanitize(payload)
 
     def _handle_response(self, resp):
         if not resp: return
@@ -1241,27 +1409,44 @@ class Argus:
                     pg["lr"] *= float(lr_factor)
                 if not self.silent: print(f"[PLARV] AUTO SET_LR ×{lr_factor:.4f} at step {self._step}")
 
+            elif action == "RESET_OPTIMIZER" and self.optimizer is not None:
+                reset_data = raw.get("reset_optimizer", {})
+                for pg in self.optimizer.param_groups:
+                    if reset_data.get("reset_momentum"):
+                        for p in pg["params"]:
+                            if p in self.optimizer.state:
+                                self.optimizer.state[p].clear()
+                    if reset_data.get("reset_weight_decay"):
+                        pg["weight_decay"] = 0.0
+                    if reset_data.get("suggested_lr"):
+                        pg["lr"] = float(reset_data["suggested_lr"])
+                if not self.silent: print(f"[PLARV] AUTO RESET_OPTIMIZER at step {self._step}. Reason: {reset_data.get('reason')}")
+
+            elif action == "RESTART_LR_WARMUP" and self.optimizer is not None:
+                if lr_factor:
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] *= float(lr_factor)
+                self.lr_warmup_restart_requested = raw.get("lr_warmup_restart", True)
+                if not self.silent: print(f"[PLARV] AUTO RESTART_LR_WARMUP ×{lr_factor} at step {self._step}")
+
+            elif action == "FILTER_SAMPLES":
+                self._spike_samples = raw.get("spike_samples", [])
+                if not self.silent: print(f"[PLARV] AUTO FILTER_SAMPLES: Excluding {len(self._spike_samples)} samples at step {self._step}")
+
+            elif action == "CHECKPOINT":
+                if raw.get("checkpoint_requested") and self._ckpt:
+                    self._ckpt.on_engine_signal(step=self._step, signal_dict=raw, harm_pressure=hp)
+                if not self.silent: print(f"[PLARV] AUTO CHECKPOINT at step {self._step}")
+
+            elif action == "WARN":
+                if not self.silent: print(f"[PLARV] AUTO WARN: Engine issued a warning at step {self._step}")
+
         # ANCHOR POINT / ROLLBACK
         anchor = raw.get("anchor_point")
         if anchor and isinstance(anchor, dict) and anchor.get("anchor_step") is not None:
             if self._ckpt: self._ckpt._write_anchor(anchor)
 
-        # STOP / TERMINAL
-        if action == "STOP":
-            # 🛡️ SOVEREIGN GATE: If the backend says STOP, but we ALSO have a sentinel command,
-            # we MUST verify the secret before raising the halt.
-            sentinel_cmd = raw.get("sentinel_command")
-            if sentinel_cmd not in ("SIG_HALT_NOW", "SIG_INTENT_STOP"):
-                # Non-sentinel stop (e.g. engine-driven completion)
-                self.complete()
-                raise ArgusHalt(f"Protocol Termination Signal Received: {hp}", step=self._step, response=raw)
-
-        # PAUSE / SENTINEL
-        if action in ("PAUSE", "BUDGET_PAUSE"):
-            if self.on_pause: self.on_pause(raw)
-            elif self.mode == "AUTO": raise ArgusPause(f"Emergency stop: {hp}", step=self._step, response=raw)
-            else: 
-                if not self.silent: print(f"[PLARV] MANUAL WARNING: Engine requires PAUSE at step {self._step}")
+        # STOP and PAUSE actions have been removed as per user request.
 
         sentinel_cmd = raw.get("sentinel_command")
         sentinel_payload = raw.get("sentinel_payload")
@@ -1278,11 +1463,11 @@ class Argus:
                     self._verify_window = getattr(self, "_verify_window", 0) + 1
                     if not self.silent: print(f"[PLARV] SENTINEL HANDSHAKE: Intent received (Verification: {self._verify_window}/10)")
                     if self._verify_window >= 10:
-                        self.complete()
+                        self.complete(status="FAILED", error="Sentinel Stability Handshake Confirmed")
                         raise ArgusHalt("Sentinel Stability Handshake Confirmed", step=self._step, response=raw)
                 elif sentinel_cmd == "SIG_HALT_NOW":
-                    self.complete()
-                    raise ArgusHalt("Sentinel Immediate Halt Triggered (Manual Verification Succeeded)", step=self._step, response=raw)
+                        self.complete(status="FAILED", error="Sentinel Immediate Halt Triggered")
+                        raise ArgusHalt("Sentinel Immediate Halt Triggered (Manual Verification Succeeded)", step=self._step, response=raw)
             elif sentinel_cmd in ("SIG_INTENT_STOP", "SIG_HALT_NOW"):
                 if not self.silent:
                     print(f"[PLARV] [WARNING] Unauthorized Halt Attempt detected. Secret mismatch.")
@@ -1336,7 +1521,7 @@ class Argus:
                 "step": step
             }
             # Fire and forget
-            self._executor.submit(_post, f"{self._BASE_URL}/api/v2/runs/{self.run_id}/commands/report", self._headers, payload, 5.0, 1)
+            self._executor.submit(_post, f"{self._BASE_URL}/v2/runs/{self.run_id}/commands/report", self._headers, payload, 5.0, 1)
         except Exception: pass
 
     def _decrypt_payload(self, encrypted_hex: str) -> Dict:
@@ -1427,34 +1612,39 @@ class Argus:
     def _fire_async(self, payload):
         # 🛡️ TIERED RETRIES: Lower retry count for fast-path telemetry
         self._last_payload = payload
-        self._future = self._executor.submit(_post, self._url, self._headers, payload, 5.0, 3)
+        future = self._executor.submit(_post, self._url, self._headers, payload, 5.0, 3)
+        self._futures.append(future)
 
     def _collect_previous(self):
-        if self._future and self._future.done():
+        # Process ALL completed futures in order
+        latest_resp = None
+        while self._futures and self._futures[0].done():
+            future = self._futures.pop(0)
             try:
-                resp = self._future.result()
-                if "_error" in resp or "_http_error" in resp:
+                resp = future.result()
+                if resp and ("_error" in resp or "_http_error" in resp):
                     # Connection blip detected — spool the payload for catch-up
                     if self._last_payload and self._spooler:
                         self._spooler.spool(self._last_payload)
-                
-                self._decision.update(resp)
-                return resp
-            except Exception: 
+                elif resp:
+                    latest_resp = resp
+            except Exception as e:
                 # Thread level failure — spool as fallback
                 if self._last_payload and self._spooler:
                     self._spooler.spool(self._last_payload)
-                return None
-        return None
+                
+        if latest_resp:
+            self._decision.update(latest_resp)
+        return latest_resp
 
     def _watchdog(self):
         while not self._completed:
             time.sleep(10)
-            if self._last_step_time is None:
+            if self._last_step_time is None or self.watchdog_timeout is None:
                 continue
-            if time.time() - self._last_step_time > 120:
+            if time.time() - self._last_step_time > self.watchdog_timeout:
                 if not self._completed:
-                    self.complete()
+                    self.fail(reason="watchdog_timeout_hang")
                     break
 
     def _auto_grad_norm(self, full: bool = False) -> Dict[str, float]:

@@ -1,11 +1,11 @@
 import logging
 from typing import Any, Dict, Optional
 from plarv.argus import Argus
-from plarv.callback import ArgusCallback
+from plarv.integrations.callback import ArgusCallback
 
 logger = logging.getLogger("plarv.integrations.unsloth")
 
-def patch_unsloth(model: Any, api_key: str, run_id: Optional[str] = None, silent: bool = False):
+def patch_unsloth(model: Any, api_key: Optional[str] = None, run_id: Optional[str] = None, silent: bool = False):
     """
     Convenience function for Unsloth users.
     Usage:
@@ -37,7 +37,7 @@ class UnslothArgusCallback(ArgusCallback):
     """
     Optimized callback for Unsloth FastLanguageModel training.
     """
-    def __init__(self, api_key: str, run_id: Optional[str] = None, silent: bool = False):
+    def __init__(self, api_key: Optional[str] = None, run_id: Optional[str] = None, silent: bool = False):
         self.api_key = api_key
         self.run_id = run_id
         self.silent = silent

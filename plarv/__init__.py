@@ -15,7 +15,7 @@ from .exceptions import (
     ArgusApiError, ArgusConnectionError
 )
 
-__version__ = "2.0.0"
+__version__ = "1.1.4"
 __all__ = [
     "Argus",
     "LocalDetector",

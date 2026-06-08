@@ -13,10 +13,10 @@ from ..argus import Argus
 from ..exceptions import ArgusPause, ArgusCheckpoint
 
 try:
-    from pytorch_lightning import Callback as _Base
+    from pytorch_lightning import Callback as _Base # type: ignore
 except ImportError:
     try:
-        from lightning import Callback as _Base
+        from lightning import Callback as _Base # type: ignore
     except ImportError:
         _Base = object
 
@@ -34,7 +34,7 @@ class ArgusLightningCallback(_Base):
 
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         run_id:  Optional[str] = None,
         mode:    str           = "MANUAL",
         silent:  bool          = False,
